@@ -1,0 +1,6 @@
+/storage-r2
+/bin/
+*.test
+*.out
+vendor/
+.env
