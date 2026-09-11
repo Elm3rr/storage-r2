@@ -25,13 +25,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	store, err := storage.NewR2Store(cfg)
-	if err != nil {
-		logger.Error("no se pudo inicializar cliente R2", "error", err)
-		os.Exit(1)
-	}
-
-	h := httpapi.NewHandler(store, cfg, logger)
+	// No hay un único cliente R2 que inicializar al arrancar: cada request
+	// trae su propia cuenta/bucket/token (ver internal/http.extractR2Credentials),
+	// así que storage.NewR2Store se pasa directo como factory por request.
+	h := httpapi.NewHandler(storage.NewR2Store, cfg, logger)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", h.HealthCheck)
 	mux.HandleFunc("POST /objects", h.UploadObjects)

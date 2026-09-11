@@ -27,22 +27,49 @@ import (
 
 const maxFolderLength = 512
 
+// StoreFactory construye un ObjectStore a partir de las credenciales de R2
+// que trajo una request puntual. storage-r2 no tiene una única cuenta/bucket
+// fija: cada request arma su propio cliente, así puede ser reusado por
+// cualquier microservicio consumidor con su propio token de Cloudflare.
+type StoreFactory func(storage.R2Credentials) (storage.ObjectStore, error)
+
 // Handler agrupa las dependencias de los 3 endpoints.
 type Handler struct {
-	store    storage.ObjectStore
-	maxSize  int64
-	maxFiles int
-	logger   *slog.Logger
+	storeFactory StoreFactory
+	maxSize      int64
+	maxFiles     int
+	logger       *slog.Logger
 }
 
 // NewHandler construye un Handler listo para registrarse en un http.ServeMux.
-func NewHandler(store storage.ObjectStore, cfg *config.Config, logger *slog.Logger) *Handler {
+func NewHandler(storeFactory StoreFactory, cfg *config.Config, logger *slog.Logger) *Handler {
 	return &Handler{
-		store:    store,
-		maxSize:  cfg.MaxFileSize,
-		maxFiles: cfg.MaxFilesPerRequest,
-		logger:   logger,
+		storeFactory: storeFactory,
+		maxSize:      cfg.MaxFileSize,
+		maxFiles:     cfg.MaxFilesPerRequest,
+		logger:       logger,
 	}
+}
+
+// extractR2Credentials lee las credenciales de R2 que debe traer CADA
+// request a /objects, vía headers. Nunca se deben loguear estos valores
+// (ni siquiera el error de validación los incluye) — son secretos de vida
+// corta que solo importan para esta request puntual.
+func extractR2Credentials(r *http.Request) (storage.R2Credentials, *apiError) {
+	creds := storage.R2Credentials{
+		AccountID:       r.Header.Get("X-R2-Account-Id"),
+		Bucket:          r.Header.Get("X-R2-Bucket"),
+		AccessKeyID:     r.Header.Get("X-R2-Access-Key-Id"),
+		SecretAccessKey: r.Header.Get("X-R2-Secret-Access-Key"),
+	}
+	if creds.AccountID == "" || creds.Bucket == "" || creds.AccessKeyID == "" || creds.SecretAccessKey == "" {
+		return storage.R2Credentials{}, &apiError{
+			http.StatusBadRequest, "INVALID_REQUEST",
+			"faltan credenciales de R2 en los headers (X-R2-Account-Id, X-R2-Bucket, X-R2-Access-Key-Id, X-R2-Secret-Access-Key)",
+			nil,
+		}
+	}
+	return creds, nil
 }
 
 // apiError representa un error de respuesta HTTP. cause solo se usa para
@@ -71,8 +98,9 @@ func writeError(w http.ResponseWriter, logger *slog.Logger, err *apiError) {
 	})
 }
 
-// HealthCheck confirma que el proceso HTTP está vivo. No consulta R2; la
-// configuración de R2 ya se validó en el arranque del servicio.
+// HealthCheck confirma que el proceso HTTP está vivo. No consulta R2 ni
+// requiere credenciales — storage-r2 ya no tiene ninguna cuenta/bucket fija
+// que validar al arrancar (ver extractR2Credentials).
 func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -172,14 +200,15 @@ func detectContentType(part *multipart.Part) (io.Reader, string, error) {
 }
 
 // rollback elimina los objetos ya subidos en una carga múltiple que falló a
-// mitad de camino. Usa un contexto propio (no el del request, que puede
-// estar cancelado por el error original) con timeout acotado. Si un delete
-// de rollback también falla, se registra en detalle pero la operación
-// completa sigue considerándose fallida.
-func (h *Handler) rollback(keys []string) {
+// mitad de camino, usando el mismo store (y por tanto las mismas
+// credenciales) de la request que falló. Usa un contexto propio (no el del
+// request, que puede estar cancelado por el error original) con timeout
+// acotado. Si un delete de rollback también falla, se registra en detalle
+// pero la operación completa sigue considerándose fallida.
+func (h *Handler) rollback(store storage.ObjectStore, keys []string) {
 	for _, key := range keys {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := h.store.Delete(ctx, key); err != nil {
+		if err := store.Delete(ctx, key); err != nil {
 			h.logger.Error("rollback: no se pudo eliminar objeto huérfano", "key", key, "error", err)
 		} else {
 			h.logger.Warn("rollback: objeto eliminado tras fallo de carga múltiple", "key", key)
@@ -196,6 +225,18 @@ func (h *Handler) rollback(keys []string) {
 // README como parte del contrato.
 func (h *Handler) UploadObjects(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	creds, apiErr := extractR2Credentials(r)
+	if apiErr != nil {
+		writeError(w, h.logger, apiErr)
+		return
+	}
+	store, err := h.storeFactory(creds)
+	if err != nil {
+		writeError(w, h.logger, &apiError{http.StatusInternalServerError, "STORAGE_ERROR", "no se pudo inicializar el cliente de almacenamiento", err})
+		return
+	}
+
 	mr, err := r.MultipartReader()
 	if err != nil {
 		writeError(w, h.logger, &apiError{http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "se esperaba multipart/form-data", err})
@@ -213,7 +254,7 @@ func (h *Handler) UploadObjects(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if err != nil {
-			h.rollback(uploadedKeys)
+			h.rollback(store, uploadedKeys)
 			writeError(w, h.logger, &apiError{http.StatusBadRequest, "INVALID_REQUEST", "cuerpo multipart malformado", err})
 			return
 		}
@@ -238,7 +279,7 @@ func (h *Handler) UploadObjects(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if fileCount >= h.maxFiles {
-				h.rollback(uploadedKeys)
+				h.rollback(store, uploadedKeys)
 				writeError(w, h.logger, &apiError{http.StatusBadRequest, "INVALID_REQUEST", "demasiados archivos", nil})
 				return
 			}
@@ -255,8 +296,8 @@ func (h *Handler) UploadObjects(w http.ResponseWriter, r *http.Request) {
 			key := folder + "/" + uuid.NewString() + safeExtension(part.FileName())
 			limited := &limitedReader{r: body, n: h.maxSize}
 
-			if err := h.store.Put(r.Context(), key, limited, contentType); err != nil {
-				h.rollback(uploadedKeys)
+			if err := store.Put(r.Context(), key, limited, contentType); err != nil {
+				h.rollback(store, uploadedKeys)
 				if errors.Is(err, errFileTooLarge) {
 					writeError(w, h.logger, &apiError{http.StatusRequestEntityTooLarge, "FILE_TOO_LARGE", "archivo excede el tamaño máximo permitido", err})
 				} else {
@@ -296,6 +337,17 @@ type deleteRequest struct {
 // deshacer eso, y aquí no hay nada que revertir: la key que sí se borró ya
 // no existe).
 func (h *Handler) DeleteObjects(w http.ResponseWriter, r *http.Request) {
+	creds, apiErr := extractR2Credentials(r)
+	if apiErr != nil {
+		writeError(w, h.logger, apiErr)
+		return
+	}
+	store, err := h.storeFactory(creds)
+	if err != nil {
+		writeError(w, h.logger, &apiError{http.StatusInternalServerError, "STORAGE_ERROR", "no se pudo inicializar el cliente de almacenamiento", err})
+		return
+	}
+
 	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
 		writeError(w, h.logger, &apiError{http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "se esperaba application/json", nil})
 		return
@@ -317,7 +369,7 @@ func (h *Handler) DeleteObjects(w http.ResponseWriter, r *http.Request) {
 			writeError(w, h.logger, &apiError{http.StatusBadRequest, "INVALID_REQUEST", "key vacía", nil})
 			return
 		}
-		if err := h.store.Delete(r.Context(), key); err != nil {
+		if err := store.Delete(r.Context(), key); err != nil {
 			h.logger.Error("delete falló", "key", key, "error", err)
 			failed = append(failed, key)
 		}

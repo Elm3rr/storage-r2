@@ -8,13 +8,14 @@ import (
 )
 
 // Config contiene la configuración tipada del servicio, leída de variables
-// de entorno. No hay valores hardcodeados para los límites ni para las
-// credenciales de R2.
+// de entorno. No hay valores hardcodeados para los límites.
+//
+// Las credenciales de R2 (cuenta, bucket, access key, secret) NO viven aquí:
+// storage-r2 es un proxy genérico reusable por cualquier microservicio, y
+// cada uno trae su propio token de R2 por request (ver internal/http,
+// extractR2Credentials) en vez de que este servicio custodie un único
+// "super-token" fijo para todos los consumidores.
 type Config struct {
-	R2Endpoint         string
-	R2Bucket           string
-	R2AccessKeyID      string
-	R2SecretAccessKey  string
 	ServerPort         string
 	MaxFileSize        int64
 	MaxFilesPerRequest int
@@ -26,28 +27,12 @@ const (
 	defaultMaxFiles          = 20
 )
 
-// Load lee y valida la configuración obligatoria, fallando rápido si falta
-// alguna variable requerida o si algún valor numérico es inválido.
+// Load lee la configuración del servicio. Ninguna variable es obligatoria:
+// todo tiene un default razonable. Solo falla si un valor numérico presente
+// es inválido.
 func Load() (*Config, error) {
-	var missing []string
-	req := func(key string) string {
-		v := os.Getenv(key)
-		if v == "" {
-			missing = append(missing, key)
-		}
-		return v
-	}
-
 	cfg := &Config{
-		R2Endpoint:        req("R2_ENDPOINT"),
-		R2Bucket:          req("R2_BUCKET"),
-		R2AccessKeyID:     req("R2_ACCESS_KEY_ID"),
-		R2SecretAccessKey: req("R2_SECRET_ACCESS_KEY"),
-		ServerPort:        envOrDefault("SERVER_PORT", defaultServerPort),
-	}
-
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("faltan variables de entorno obligatorias: %v", missing)
+		ServerPort: envOrDefault("SERVER_PORT", defaultServerPort),
 	}
 
 	maxFileSize, err := envInt64OrDefault("MAX_FILE_SIZE", defaultMaxFileSize)

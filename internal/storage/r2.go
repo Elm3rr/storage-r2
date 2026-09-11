@@ -4,6 +4,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -11,8 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-
-	"storage-r2/internal/config"
 )
 
 // ObjectStore es el contrato mínimo que necesita la capa HTTP. Permite
@@ -35,24 +34,42 @@ type R2Store struct {
 	bucket   string
 }
 
-// NewR2Store inicializa el cliente S3/R2. No realiza ninguna llamada de red;
-// las credenciales y el endpoint se validan de forma efectiva en el primer
-// Put/Delete real.
-func NewR2Store(cfg *config.Config) (*R2Store, error) {
-	creds := credentials.NewStaticCredentialsProvider(
-		cfg.R2AccessKeyID, cfg.R2SecretAccessKey, "",
+// R2Credentials son los datos de una cuenta/bucket de R2 que trae CADA
+// request (ver internal/http, extractR2Credentials), no una configuración
+// fija del servicio: storage-r2 no custodia ningún token de forma
+// permanente, así puede ser reusado por cualquier microservicio con su
+// propia cuenta/bucket/token de Cloudflare.
+type R2Credentials struct {
+	// AccountID de Cloudflare, usado para construir el endpoint S3-compatible
+	// (https://{AccountID}.r2.cloudflarestorage.com) — no se recibe la URL
+	// completa, solo el id de cuenta.
+	AccountID       string
+	Bucket          string
+	AccessKeyID     string
+	SecretAccessKey string
+}
+
+// NewR2Store inicializa el cliente S3/R2 para una request puntual, a partir
+// de las credenciales que trajo esa request. No realiza ninguna llamada de
+// red; las credenciales y el endpoint se validan de forma efectiva en el
+// primer Put/Delete real. Devuelve la interfaz ObjectStore (no *R2Store)
+// para poder usarse directamente como http.StoreFactory.
+func NewR2Store(creds R2Credentials) (ObjectStore, error) {
+	awsCreds := credentials.NewStaticCredentialsProvider(
+		creds.AccessKeyID, creds.SecretAccessKey, "",
 	)
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion("auto"),
-		awsconfig.WithCredentialsProvider(creds),
+		awsconfig.WithCredentialsProvider(awsCreds),
 	)
 	if err != nil {
 		return nil, err
 	}
 
+	endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", creds.AccountID)
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(cfg.R2Endpoint)
+		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = true
 		// R2 no es totalmente compatible con el cálculo/validación de
 		// checksums flexibles que el SDK activa por defecto desde v1.x
@@ -67,7 +84,7 @@ func NewR2Store(cfg *config.Config) (*R2Store, error) {
 		u.Concurrency = 1 // acota memoria: nunca más de un part en buffer
 	})
 
-	return &R2Store{client: client, uploader: uploader, bucket: cfg.R2Bucket}, nil
+	return &R2Store{client: client, uploader: uploader, bucket: creds.Bucket}, nil
 }
 
 var _ ObjectStore = (*R2Store)(nil)

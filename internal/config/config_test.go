@@ -2,16 +2,7 @@ package config
 
 import "testing"
 
-func setAllRequired(t *testing.T) {
-	t.Helper()
-	t.Setenv("R2_ENDPOINT", "https://example.r2.cloudflarestorage.com")
-	t.Setenv("R2_BUCKET", "test-bucket")
-	t.Setenv("R2_ACCESS_KEY_ID", "access-key")
-	t.Setenv("R2_SECRET_ACCESS_KEY", "secret-key")
-}
-
 func TestLoad_AllPresent(t *testing.T) {
-	setAllRequired(t)
 	t.Setenv("SERVER_PORT", "9090")
 	t.Setenv("MAX_FILE_SIZE", "123456")
 	t.Setenv("MAX_FILES_PER_REQUEST", "5")
@@ -19,9 +10,6 @@ func TestLoad_AllPresent(t *testing.T) {
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.R2Endpoint != "https://example.r2.cloudflarestorage.com" {
-		t.Errorf("R2Endpoint = %q", cfg.R2Endpoint)
 	}
 	if cfg.ServerPort != "9090" {
 		t.Errorf("ServerPort = %q, want 9090", cfg.ServerPort)
@@ -34,20 +22,7 @@ func TestLoad_AllPresent(t *testing.T) {
 	}
 }
 
-func TestLoad_MissingRequired(t *testing.T) {
-	t.Setenv("R2_BUCKET", "test-bucket")
-	t.Setenv("R2_ACCESS_KEY_ID", "access-key")
-	t.Setenv("R2_SECRET_ACCESS_KEY", "secret-key")
-	// R2_ENDPOINT deliberadamente ausente.
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected error for missing R2_ENDPOINT, got nil")
-	}
-}
-
 func TestLoad_InvalidMaxFileSize(t *testing.T) {
-	setAllRequired(t)
 	t.Setenv("MAX_FILE_SIZE", "not-a-number")
 
 	_, err := Load()
@@ -57,7 +32,6 @@ func TestLoad_InvalidMaxFileSize(t *testing.T) {
 }
 
 func TestLoad_InvalidMaxFiles(t *testing.T) {
-	setAllRequired(t)
 	t.Setenv("MAX_FILES_PER_REQUEST", "not-a-number")
 
 	_, err := Load()
@@ -67,7 +41,6 @@ func TestLoad_InvalidMaxFiles(t *testing.T) {
 }
 
 func TestLoad_ZeroLimitsRejected(t *testing.T) {
-	setAllRequired(t)
 	t.Setenv("MAX_FILE_SIZE", "0")
 
 	_, err := Load()
@@ -76,9 +49,9 @@ func TestLoad_ZeroLimitsRejected(t *testing.T) {
 	}
 }
 
+// Ninguna variable es obligatoria: storage-r2 ya no tiene una cuenta/bucket
+// de R2 fija que validar al arrancar (viaja por request, ver internal/http).
 func TestLoad_Defaults(t *testing.T) {
-	setAllRequired(t)
-
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

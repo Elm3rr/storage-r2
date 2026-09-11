@@ -71,7 +71,21 @@ func newTestHandler(store storage.ObjectStore, maxSize int64, maxFiles int) (*Ha
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 	cfg := &config.Config{MaxFileSize: maxSize, MaxFilesPerRequest: maxFiles}
-	return NewHandler(store, cfg, logger), &logBuf
+	// storage-r2 ya no tiene un store fijo: la factory ignora las
+	// credenciales de la request y siempre devuelve el fake inyectado por
+	// el test, que es lo único que importa para probar la capa HTTP.
+	factory := func(storage.R2Credentials) (storage.ObjectStore, error) { return store, nil }
+	return NewHandler(factory, cfg, logger), &logBuf
+}
+
+// setR2Headers agrega los 4 headers de credenciales de R2 que hoy exige
+// cualquier request a /objects (ver extractR2Credentials). Los valores son
+// dummy: la fakeStore de estos tests no habla con R2 real.
+func setR2Headers(req *http.Request) {
+	req.Header.Set("X-R2-Account-Id", "account-test")
+	req.Header.Set("X-R2-Bucket", "bucket-test")
+	req.Header.Set("X-R2-Access-Key-Id", "ak-test")
+	req.Header.Set("X-R2-Secret-Access-Key", "sk-test")
 }
 
 func buildMultipartBody(t *testing.T, folder string, files map[string]string) (*bytes.Buffer, string) {
@@ -151,6 +165,7 @@ func TestUpload_InvalidContentType(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/objects", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
+	setR2Headers(req)
 	rec := httptest.NewRecorder()
 	h.UploadObjects(rec, req)
 
@@ -172,6 +187,7 @@ func TestUpload_InvalidFolder(t *testing.T) {
 			body, contentType := buildMultipartBody(t, folder, map[string]string{"a.txt": "hello"})
 			req := httptest.NewRequest(http.MethodPost, "/objects", body)
 			req.Header.Set("Content-Type", contentType)
+			setR2Headers(req)
 			rec := httptest.NewRecorder()
 			h.UploadObjects(rec, req)
 
@@ -194,6 +210,7 @@ func TestUpload_FileTooLarge(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/objects", body)
 	req.Header.Set("Content-Type", contentType)
+	setR2Headers(req)
 	rec := httptest.NewRecorder()
 	h.UploadObjects(rec, req)
 
@@ -214,6 +231,7 @@ func TestUpload_TooManyFiles(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/objects", body)
 	req.Header.Set("Content-Type", contentType)
+	setR2Headers(req)
 	rec := httptest.NewRecorder()
 	h.UploadObjects(rec, req)
 
@@ -236,6 +254,7 @@ func TestUpload_SingleFileSuccess(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/objects", body)
 	req.Header.Set("Content-Type", contentType)
+	setR2Headers(req)
 	rec := httptest.NewRecorder()
 	h.UploadObjects(rec, req)
 
@@ -268,6 +287,7 @@ func TestUpload_MultiFileSuccess(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/objects", body)
 	req.Header.Set("Content-Type", contentType)
+	setR2Headers(req)
 	rec := httptest.NewRecorder()
 	h.UploadObjects(rec, req)
 
@@ -291,6 +311,7 @@ func TestUpload_PartialFailureRollback(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/objects", body)
 	req.Header.Set("Content-Type", contentType)
+	setR2Headers(req)
 	rec := httptest.NewRecorder()
 	h.UploadObjects(rec, req)
 
@@ -320,6 +341,7 @@ func TestUpload_RollbackDeleteAlsoFails(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/objects", body)
 	req.Header.Set("Content-Type", contentType)
+	setR2Headers(req)
 	rec := httptest.NewRecorder()
 
 	// No debe entrar en pánico aunque el propio rollback falle.
@@ -340,6 +362,7 @@ func TestDelete_Single(t *testing.T) {
 	reqBody, _ := json.Marshal(map[string]any{"keys": []string{"habitaciones/1/galeria/a.webp"}})
 	req := httptest.NewRequest(http.MethodDelete, "/objects", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	setR2Headers(req)
 	rec := httptest.NewRecorder()
 	h.DeleteObjects(rec, req)
 
@@ -359,6 +382,7 @@ func TestDelete_Multiple(t *testing.T) {
 	reqBody, _ := json.Marshal(map[string]any{"keys": keys})
 	req := httptest.NewRequest(http.MethodDelete, "/objects", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	setR2Headers(req)
 	rec := httptest.NewRecorder()
 	h.DeleteObjects(rec, req)
 
@@ -382,11 +406,70 @@ func TestDelete_InvalidBody(t *testing.T) {
 
 			req := httptest.NewRequest(http.MethodDelete, "/objects", strings.NewReader(payload))
 			req.Header.Set("Content-Type", "application/json")
+			setR2Headers(req)
 			rec := httptest.NewRecorder()
 			h.DeleteObjects(rec, req)
 
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+var r2CredentialHeaders = []string{
+	"X-R2-Account-Id", "X-R2-Bucket", "X-R2-Access-Key-Id", "X-R2-Secret-Access-Key",
+}
+
+func TestUpload_MissingCredentials(t *testing.T) {
+	for _, missing := range r2CredentialHeaders {
+		t.Run(missing, func(t *testing.T) {
+			store := &fakeStore{}
+			h, _ := newTestHandler(store, 1<<20, 20)
+
+			body, contentType := buildMultipartBody(t, "habitaciones/1/galeria", map[string]string{"a.webp": "1"})
+			req := httptest.NewRequest(http.MethodPost, "/objects", body)
+			req.Header.Set("Content-Type", contentType)
+			setR2Headers(req)
+			req.Header.Del(missing)
+			rec := httptest.NewRecorder()
+			h.UploadObjects(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (missing %s)", rec.Code, missing)
+			}
+			if code, _ := decodeError(t, rec); code != "INVALID_REQUEST" {
+				t.Errorf("code = %q, want INVALID_REQUEST", code)
+			}
+			if len(store.puts) != 0 {
+				t.Errorf("no debería llamarse Put si faltan credenciales de R2")
+			}
+		})
+	}
+}
+
+func TestDelete_MissingCredentials(t *testing.T) {
+	for _, missing := range r2CredentialHeaders {
+		t.Run(missing, func(t *testing.T) {
+			store := &fakeStore{}
+			h, _ := newTestHandler(store, 1<<20, 20)
+
+			reqBody, _ := json.Marshal(map[string]any{"keys": []string{"a.webp"}})
+			req := httptest.NewRequest(http.MethodDelete, "/objects", bytes.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			setR2Headers(req)
+			req.Header.Del(missing)
+			rec := httptest.NewRecorder()
+			h.DeleteObjects(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (missing %s)", rec.Code, missing)
+			}
+			if code, _ := decodeError(t, rec); code != "INVALID_REQUEST" {
+				t.Errorf("code = %q, want INVALID_REQUEST", code)
+			}
+			if len(store.deletes) != 0 {
+				t.Errorf("no debería llamarse Delete si faltan credenciales de R2")
 			}
 		})
 	}

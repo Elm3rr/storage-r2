@@ -16,19 +16,34 @@ Microservicio de infraestructura, extremadamente ligero, que actúa como capa HT
 
 No validar JWT no significa aceptar cualquier entrada: el servicio sí aplica validaciones técnicas sobre `folder` y los archivos (ver más abajo).
 
+`storage-r2` **no custodia ninguna credencial de R2 de forma permanente**. No tiene una cuenta/bucket fijo configurado al arrancar — cada request a `POST /objects` o `DELETE /objects` trae su propio token de Cloudflare (ver "Credenciales de R2 por request" más abajo). Esto es intencional: el servicio es un proxy genérico, reusable por cualquier microservicio (de este monorepo o de otro proyecto) sin atarlo a una cuenta de R2 en particular, y permite que cada consumidor use un token acotado (least-privilege) a su propio bucket/prefijo en vez de que un único "super-token" tenga acceso a todo.
+
+Estos valores nunca se loguean (ni siquiera en los logs de error) ni se exponen en ninguna respuesta — viajan solo por header, en la red interna, para esa request puntual.
+
+## Credenciales de R2 por request
+
+`POST /objects` y `DELETE /objects` (no `GET /health`) requieren estos 4 headers en cada llamada:
+
+| Header | Descripción |
+|---|---|
+| `X-R2-Account-Id` | Account ID de Cloudflare. `storage-r2` arma el endpoint S3-compatible como `https://{account_id}.r2.cloudflarestorage.com` — no se manda la URL completa. |
+| `X-R2-Bucket` | Bucket destino de esta request. |
+| `X-R2-Access-Key-Id` | Access key del token de R2 (permanente, sin expiración). |
+| `X-R2-Secret-Access-Key` | Secret del token de R2. |
+
+Si falta alguno, la respuesta es `400 INVALID_REQUEST`. Cada microservicio consumidor guarda su propio token (idealmente generado con permisos acotados a su propio prefijo/bucket vía el dashboard de Cloudflare) en su propia configuración, y lo manda en cada llamada — `storage-r2` no lo recuerda entre requests.
+
+Solo se soportan tokens permanentes (access key + secret); no hay soporte para credenciales temporales de Cloudflare con `session token`.
+
 ## Variables de entorno
 
 | Variable | Obligatoria | Default | Descripción |
 |---|---|---|---|
-| `R2_ENDPOINT` | sí | — | Endpoint S3-compatible de la cuenta de R2 |
-| `R2_BUCKET` | sí | — | Bucket destino |
-| `R2_ACCESS_KEY_ID` | sí | — | Access key de R2 |
-| `R2_SECRET_ACCESS_KEY` | sí | — | Secret key de R2 |
 | `SERVER_PORT` | no | `8002` | Puerto HTTP del servicio |
 | `MAX_FILE_SIZE` | no | `10485760` (10MB) | Tamaño máximo por archivo, en bytes |
 | `MAX_FILES_PER_REQUEST` | no | `20` | Máximo de archivos por request de subida |
 
-Si falta alguna variable obligatoria, el servicio falla al arrancar (fail-fast) en vez de arrancar en un estado inconsistente. Ver `.env.example`.
+Ninguna es obligatoria (todas tienen default) — a diferencia de las credenciales de R2, que no son configuración del servicio sino que viajan por request (ver arriba). Ver `.env.example`.
 
 ## Endpoints
 
@@ -49,6 +64,10 @@ Sube uno o varios archivos bajo un mismo prefijo lógico (`folder`).
 
 ```bash
 curl -X POST http://localhost:8002/objects \
+  -H "X-R2-Account-Id: <account_id>" \
+  -H "X-R2-Bucket: hoteleria-storage" \
+  -H "X-R2-Access-Key-Id: <access_key>" \
+  -H "X-R2-Secret-Access-Key: <secret_key>" \
   -F folder=habitaciones/123/galeria \
   -F file=@foto1.webp \
   -F file=@foto2.webp
@@ -76,6 +95,10 @@ Elimina una o varias keys.
 ```bash
 curl -X DELETE http://localhost:8002/objects \
   -H "Content-Type: application/json" \
+  -H "X-R2-Account-Id: <account_id>" \
+  -H "X-R2-Bucket: hoteleria-storage" \
+  -H "X-R2-Access-Key-Id: <access_key>" \
+  -H "X-R2-Secret-Access-Key: <secret_key>" \
   -d '{"keys": ["habitaciones/123/galeria/550e8400-e29b-41d4-a716-446655440000.webp"]}'
 ```
 
@@ -108,13 +131,14 @@ Nunca se exponen detalles del SDK, credenciales ni el endpoint privado de R2 en 
 
 1. Validar que la entidad de negocio exista y que el usuario tenga permiso (su propio contexto de seguridad — `storage-r2` no participa en eso).
 2. Decidir sus propios tipos de archivo permitidos y límites de negocio (`storage-r2` solo aplica límites técnicos globales).
-3. Elegir su propio prefijo lógico (`folder`), por ejemplo:
+3. Tener su propio token de R2 (account id, bucket, access key, secret) en su propia configuración/env — idealmente un token generado en Cloudflare con permisos acotados a su propio prefijo, no un token con acceso a todo el bucket. `storage-r2` no lo provee ni lo recuerda.
+4. Elegir su propio prefijo lógico (`folder`), por ejemplo:
    - `habitaciones/{habitacionId}/galeria`
    - `usuarios/{usuarioId}/perfil`
    - `proveedores/{proveedorId}/documentos`
-4. Llamar a `POST /objects` con ese `folder` y los archivos.
-5. Guardar las `keys` devueltas en su propia base de datos — **no** la URL pública completa, para poder cambiar el dominio público sin tocar todas las bases de datos consumidoras.
-6. Llamar a `DELETE /objects` con las keys correspondientes cuando el recurso de negocio se elimine.
+5. Llamar a `POST /objects` con ese `folder`, los archivos, y sus 4 headers de credenciales (ver "Credenciales de R2 por request").
+6. Guardar las `keys` devueltas en su propia base de datos — **no** la URL pública completa, para poder cambiar el dominio público sin tocar todas las bases de datos consumidoras.
+7. Llamar a `DELETE /objects` (con sus mismas credenciales) con las keys correspondientes cuando el recurso de negocio se elimine.
 
 Ejemplo: `habitaciones` expondría sus propios endpoints de dominio (`POST /habitaciones/{id}/galeria`, etc.) que internamente validan la habitación y los permisos, y luego llaman a `storage-r2` con `folder=habitaciones/{id}/galeria`.
 
@@ -128,9 +152,11 @@ Ejemplo: `habitaciones` expondría sus propios endpoints de dominio (`POST /habi
 ## Desarrollo local
 
 ```bash
-cp .env.example .env   # completar credenciales reales de R2
+cp .env.example .env   # ajustar SERVER_PORT/límites si hace falta — no hay credenciales de R2 que completar aquí
 go run ./cmd/server
 ```
+
+Para probar `POST`/`DELETE /objects` contra R2 real, se necesita un token de Cloudflare a mano (ver "Credenciales de R2 por request") — no se configura en `.env`, se manda por header en cada request.
 
 ## Tests
 
