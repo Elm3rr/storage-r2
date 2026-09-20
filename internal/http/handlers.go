@@ -25,7 +25,15 @@ import (
 	"storage-r2/internal/storage"
 )
 
-const maxFolderLength = 512
+const (
+	maxFolderLength = 512
+	maxNameLength   = 128
+)
+
+// namePattern restringe el nombre explícito opcional (`name`) a caracteres
+// seguros para una object key: sin separadores de ruta ni puntos, la
+// extensión se toma siempre del archivo subido (ver safeExtension).
+var namePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // Handler agrupa las dependencias de los 3 endpoints.
 type Handler struct {
@@ -204,6 +212,8 @@ func (h *Handler) UploadObjects(w http.ResponseWriter, r *http.Request) {
 
 	var folder string
 	folderSet := false
+	var name string
+	nameSet := false
 	var uploadedKeys []string
 	fileCount := 0
 
@@ -232,9 +242,36 @@ func (h *Handler) UploadObjects(w http.ResponseWriter, r *http.Request) {
 			}
 			folderSet = true
 
+		case "name":
+			// Nombre explícito opcional (sin extensión) para el objeto: permite a
+			// un consumidor guardar una key determinista (`{folder}/{name}.ext`) y
+			// reemplazarla al re-subir. Solo aplica a subidas de un único archivo.
+			if part.FileName() != "" || nameSet {
+				writeError(w, h.logger, &apiError{http.StatusBadRequest, "INVALID_REQUEST", "campo name inválido", nil})
+				return
+			}
+			if fileCount > 0 {
+				writeError(w, h.logger, &apiError{http.StatusBadRequest, "INVALID_REQUEST", "name debe enviarse antes que los archivos", nil})
+				return
+			}
+			rawName, _ := io.ReadAll(io.LimitReader(part, maxNameLength+1))
+			if !namePattern.Match(rawName) {
+				writeError(w, h.logger, &apiError{http.StatusBadRequest, "INVALID_REQUEST", "name inválido", nil})
+				return
+			}
+			name = string(rawName)
+			nameSet = true
+
 		case "file":
 			if !folderSet {
 				writeError(w, h.logger, &apiError{http.StatusBadRequest, "INVALID_REQUEST", "folder debe enviarse antes que los archivos", nil})
+				return
+			}
+			if nameSet && fileCount >= 1 {
+				// Sin rollback a propósito: con `name` la key es determinista y el
+				// primer objeto pudo haber reemplazado a uno previo; borrarlo
+				// dejaría al consumidor sin archivo.
+				writeError(w, h.logger, &apiError{http.StatusBadRequest, "INVALID_REQUEST", "name solo admite un archivo", nil})
 				return
 			}
 			if fileCount >= h.maxFiles {
@@ -252,7 +289,11 @@ func (h *Handler) UploadObjects(w http.ResponseWriter, r *http.Request) {
 				writeError(w, h.logger, &apiError{http.StatusBadRequest, "INVALID_REQUEST", "archivo vacío", nil})
 				return
 			}
-			key := folder + "/" + uuid.NewString() + safeExtension(part.FileName())
+			objectName := uuid.NewString()
+			if nameSet {
+				objectName = name
+			}
+			key := folder + "/" + objectName + safeExtension(part.FileName())
 			limited := &limitedReader{r: body, n: h.maxSize}
 
 			if err := h.store.Put(r.Context(), key, limited, contentType); err != nil {

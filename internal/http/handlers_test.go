@@ -422,3 +422,157 @@ func TestSafeExtension(t *testing.T) {
 		}
 	}
 }
+
+// multipartPart describe un campo del multipart en el orden exacto en que se
+// escribe, para poder probar contratos sensibles al orden (`folder`, `name`
+// y `file`).
+type multipartPart struct {
+	field    string // nombre del campo (folder, name, file)
+	filename string // solo para file
+	content  string
+}
+
+func buildOrderedMultipart(t *testing.T, parts []multipartPart) (*bytes.Buffer, string) {
+	t.Helper()
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	for _, p := range parts {
+		if p.filename != "" {
+			fw, err := w.CreateFormFile(p.field, p.filename)
+			if err != nil {
+				t.Fatalf("CreateFormFile: %v", err)
+			}
+			if _, err := fw.Write([]byte(p.content)); err != nil {
+				t.Fatalf("write file content: %v", err)
+			}
+			continue
+		}
+		if err := w.WriteField(p.field, p.content); err != nil {
+			t.Fatalf("WriteField %s: %v", p.field, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	return body, w.FormDataContentType()
+}
+
+func postUpload(h *Handler, body *bytes.Buffer, contentType string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/objects", body)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	h.UploadObjects(rec, req)
+	return rec
+}
+
+func TestUpload_NameProducesDeterministicKey(t *testing.T) {
+	store := &fakeStore{}
+	h, _ := newTestHandler(store, 1<<20, 20)
+
+	body, ct := buildOrderedMultipart(t, []multipartPart{
+		{field: "folder", content: "habitaciones/pisos"},
+		{field: "name", content: "0b8f1c1e-7f0a-4c39-9d54-2a3b5c6d7e8f"},
+		{field: "file", filename: "croquis.SVG", content: "<svg/>"},
+	})
+	rec := postUpload(h, body, ct)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Keys []string `json:"keys"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := "habitaciones/pisos/0b8f1c1e-7f0a-4c39-9d54-2a3b5c6d7e8f.svg"
+	if len(resp.Keys) != 1 || resp.Keys[0] != want {
+		t.Fatalf("keys = %v, want [%s]", resp.Keys, want)
+	}
+	if len(store.puts) != 1 || store.puts[0].key != want {
+		t.Errorf("puts inesperado: %+v", store.puts)
+	}
+}
+
+func TestUpload_NameOverwritesSameKeyOnResubmit(t *testing.T) {
+	store := &fakeStore{}
+	h, _ := newTestHandler(store, 1<<20, 20)
+
+	for _, content := range []string{"<svg>v1</svg>", "<svg>v2</svg>"} {
+		body, ct := buildOrderedMultipart(t, []multipartPart{
+			{field: "folder", content: "habitaciones/pisos"},
+			{field: "name", content: "piso-1"},
+			{field: "file", filename: "croquis.svg", content: content},
+		})
+		if rec := postUpload(h, body, ct); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	if len(store.puts) != 2 || store.puts[0].key != store.puts[1].key {
+		t.Fatalf("se esperaban 2 Put sobre la misma key, got %+v", store.puts)
+	}
+	if len(store.deletes) != 0 {
+		t.Errorf("no debe borrar nada al reemplazar, deletes=%v", store.deletes)
+	}
+}
+
+func TestUpload_InvalidName(t *testing.T) {
+	for _, name := range []string{"", "a/b", "../x", "con.punto", "con espacio", strings.Repeat("a", maxNameLength+1)} {
+		store := &fakeStore{}
+		h, _ := newTestHandler(store, 1<<20, 20)
+
+		body, ct := buildOrderedMultipart(t, []multipartPart{
+			{field: "folder", content: "habitaciones/pisos"},
+			{field: "name", content: name},
+			{field: "file", filename: "croquis.svg", content: "<svg/>"},
+		})
+		rec := postUpload(h, body, ct)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("name=%q: status = %d, want 400", name, rec.Code)
+		}
+		if code, _ := decodeError(t, rec); code != "INVALID_REQUEST" {
+			t.Errorf("name=%q: code = %q, want INVALID_REQUEST", name, code)
+		}
+		if len(store.puts) != 0 {
+			t.Errorf("name=%q: no debe subir nada, puts=%+v", name, store.puts)
+		}
+	}
+}
+
+func TestUpload_NameAfterFileRejected(t *testing.T) {
+	store := &fakeStore{}
+	h, _ := newTestHandler(store, 1<<20, 20)
+
+	body, ct := buildOrderedMultipart(t, []multipartPart{
+		{field: "folder", content: "habitaciones/pisos"},
+		{field: "file", filename: "croquis.svg", content: "<svg/>"},
+		{field: "name", content: "piso-1"},
+	})
+	rec := postUpload(h, body, ct)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUpload_NameWithMultipleFilesRejectedWithoutRollback(t *testing.T) {
+	store := &fakeStore{}
+	h, _ := newTestHandler(store, 1<<20, 20)
+
+	body, ct := buildOrderedMultipart(t, []multipartPart{
+		{field: "folder", content: "habitaciones/pisos"},
+		{field: "name", content: "piso-1"},
+		{field: "file", filename: "a.svg", content: "<svg/>"},
+		{field: "file", filename: "b.svg", content: "<svg/>"},
+	})
+	rec := postUpload(h, body, ct)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	// La key es determinista y pudo reemplazar a un objeto previo: no se borra.
+	if len(store.deletes) != 0 {
+		t.Errorf("no debe hacer rollback con name, deletes=%v", store.deletes)
+	}
+}

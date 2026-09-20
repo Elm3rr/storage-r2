@@ -65,7 +65,21 @@ Respuesta exitosa:
 }
 ```
 
-El nombre final de cada objeto es `{folder}/{uuid}.{extension}` — el cliente nunca controla el nombre, solo el prefijo lógico. `storage-r2` no valida qué extensiones son válidas para tu dominio (eso lo decide el microservicio consumidor antes de llamar); solo aplica controles técnicos globales (tamaño, cantidad, caracteres válidos en `folder`).
+Por defecto el nombre final de cada objeto es `{folder}/{uuid}.{extension}` — el cliente controla el prefijo lógico, no el nombre.
+
+**Nombre explícito (opcional):** para recursos que necesitan una key determinista (p. ej. un único croquis por piso que se reemplaza al re-subir), se puede enviar el campo `name` **después de `folder` y antes de `file`**. La key queda `{folder}/{name}.{extension}` y, si ya existía, se sobrescribe. `name` debe cumplir `^[A-Za-z0-9_-]{1,128}$` (sin `/`, `.` ni espacios; la extensión sale del archivo) y solo se admite con **un** archivo por request; de lo contrario responde `400 INVALID_REQUEST`.
+
+```bash
+curl -X POST http://localhost:8002/objects \
+  -H "X-R2-Account-Id: <account_id>" -H "X-R2-Bucket: <bucket>" \
+  -H "X-R2-Access-Key-Id: <key>" -H "X-R2-Secret-Access-Key: <secret>" \
+  -F folder=habitaciones/pisos \
+  -F name=550e8400-e29b-41d4-a716-446655440000 \
+  -F file=@croquis.svg
+# => {"keys":["habitaciones/pisos/550e8400-e29b-41d4-a716-446655440000.svg"]}
+```
+
+`storage-r2` no valida qué extensiones son válidas para tu dominio (eso lo decide el microservicio consumidor antes de llamar); solo aplica controles técnicos globales (tamaño, cantidad, caracteres válidos en `folder`).
 
 **Regla todo-o-nada:** si un archivo falla a mitad de una carga múltiple, `storage-r2` elimina (rollback) los objetos ya subidos en esa misma request y responde con error. Nunca deja objetos huérfanos de una request fallida.
 
